@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
+import inspect
+import textwrap
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -666,3 +669,15 @@ def test_decode_metadata_update_needs_draft_decode_steps(
     speculator._configure_decode_metadata_update()
 
     assert speculator.supports_decode_metadata_update is expected
+
+
+def test_aux_hidden_states_do_not_depend_on_the_method_name():
+    # A method registered by a plugin (vllm.v1.spec_decode.registry) that captures
+    # auxiliary hidden states runs through propose() like eagle3 does.
+    source = textwrap.dedent(inspect.getsource(TargetDependentARSpeculator.propose))
+    literals = {
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant)
+    }
+    assert "eagle3" not in literals
