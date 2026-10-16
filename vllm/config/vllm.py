@@ -26,6 +26,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.v1.spec_decode.registry import get_speculative_method
 
 from .attention import AttentionConfig, HiSparseConfig
 from .aux_output import AuxOutputConfig
@@ -633,6 +634,9 @@ class VllmConfig:
             # Fill-in drafting uses a bonus query plus one query per draft token.
             # DSpark's anchor-sampling layout does not need the extra slot.
             return self.num_speculative_tokens + 1
+        registered = get_speculative_method(speculative_config.method)
+        if registered is not None and registered.num_lookahead_tokens is not None:
+            return registered.num_lookahead_tokens(speculative_config)
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # Anchor-sampling DSpark drafts a block of num_speculative_tokens
             # query tokens in which the anchor itself is the first prediction
@@ -1611,6 +1615,7 @@ class VllmConfig:
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
                     and self.speculative_config.method != "dflash"
+                    and not self.speculative_config.supports_async_scheduling()
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1645,6 +1650,7 @@ class VllmConfig:
                 and self.speculative_config.method != "draft_model"
                 and self.speculative_config.method != "dspark"
                 and self.speculative_config.method != "dflash"
+                and not self.speculative_config.supports_async_scheduling()
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
