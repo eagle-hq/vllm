@@ -63,6 +63,12 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 
 class BaseSpeculator(ABC):
     num_query_per_req: int = 1
+    # The number of tokens the target verifies per request changes from step to
+    # step (up to ``decode_query_len``), so decode CUDA graphs are captured for
+    # variable per-request query lengths instead of one uniform width. Adaptive
+    # verification turns this on by itself; a speculator that sizes its own
+    # verify batches (for example, a tree whose size changes) sets it here.
+    uses_varlen_verify_graphs: bool = False
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
 

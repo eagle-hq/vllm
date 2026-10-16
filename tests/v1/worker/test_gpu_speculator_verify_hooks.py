@@ -11,9 +11,12 @@ import inspect
 import textwrap
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+import vllm.v1.worker.gpu.spec_decode.adaptive_verification as adaptive_module
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.ngram.speculator import NgramGPUSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import (
@@ -167,3 +170,83 @@ def test_sample_tokens_calls_post_accept_between_sampling_and_state_commit():
     (commit_line,) = _call_lines(func, "self.postprocess_sampled")
     (propose_line,) = _call_lines(func, "self.speculator.propose")
     assert sample_line < hook_line < commit_line < propose_line
+
+
+# --- uses_varlen_verify_graphs -------------------------------------------------
+
+
+def _graph_runner(speculator, adaptive=None) -> GPUModelRunner:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculator = speculator
+    runner.adaptive_verification = adaptive
+    runner.attn_groups = ["groups"]
+    runner.vllm_config = "vllm_config"
+    runner.decode_query_len = 9
+    return runner
+
+
+ALWAYS = (AttentionCGSupport.ALWAYS, None)
+
+
+def test_varlen_verify_graphs_are_off_by_default():
+    assert BaseSpeculator.uses_varlen_verify_graphs is False
+    assert "uses_varlen_verify_graphs" not in DraftModelSpeculator.__dict__
+    for speculator in (None, _MinimalSpeculator.__new__(_MinimalSpeculator)):
+        runner = _graph_runner(speculator)
+        assert GPUModelRunner._use_varlen_verify_graphs(runner, None, ALWAYS) is False
+
+
+def test_adaptive_verification_still_selects_varlen_graphs():
+    runner = _graph_runner(None, adaptive=object())
+    assert GPUModelRunner._use_varlen_verify_graphs(runner, None, ALWAYS) is True
+
+
+class _VarlenSpeculator(_MinimalSpeculator):
+    uses_varlen_verify_graphs = True
+
+
+def test_speculator_opt_in_checks_backend_support_then_selects_varlen(monkeypatch):
+    seen = {}
+
+    def fake_unsupported(attn_groups, vllm_config, max_query_len, checked_layer_names):
+        seen["args"] = (attn_groups, vllm_config, max_query_len, checked_layer_names)
+
+    monkeypatch.setattr(
+        adaptive_module, "get_varlen_cudagraph_unsupported_backend", fake_unsupported
+    )
+    runner = _graph_runner(_VarlenSpeculator.__new__(_VarlenSpeculator))
+    assert GPUModelRunner._use_varlen_verify_graphs(runner, {"layer"}, ALWAYS) is True
+    assert seen["args"] == (["groups"], "vllm_config", 9, {"layer"})
+
+
+def test_speculator_opt_in_rejects_a_backend_without_varlen_graph_support(monkeypatch):
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_varlen_cudagraph_unsupported_backend",
+        lambda *args, **kwargs: ("SomeBackend", 4),
+    )
+    runner = _graph_runner(_VarlenSpeculator.__new__(_VarlenSpeculator))
+    with pytest.raises(ValueError, match="SomeBackend allows at most 4"):
+        GPUModelRunner._use_varlen_verify_graphs(runner, None, ALWAYS)
+
+
+def test_speculator_opt_in_rejects_a_model_state_without_always_support(monkeypatch):
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_varlen_cudagraph_unsupported_backend",
+        lambda *args, **kwargs: None,
+    )
+    runner = _graph_runner(_VarlenSpeculator.__new__(_VarlenSpeculator))
+    with pytest.raises(ValueError, match="MambaBackend allows none"):
+        GPUModelRunner._use_varlen_verify_graphs(
+            runner, None, (AttentionCGSupport.UNIFORM_BATCH, "MambaBackend")
+        )
+
+
+def test_initialize_kv_cache_feeds_the_varlen_decision_to_the_graph_manager():
+    func = GPUModelRunner.initialize_kv_cache
+    assert len(_call_lines(func, "self._use_varlen_verify_graphs")) == 1
+    source = inspect.getsource(func)
+    assert "varlen_decode=varlen_verify_graphs" in source
+    assert "if varlen_verify_graphs:" in source
+    assert "varlen_decode=self.adaptive_verification" not in source
