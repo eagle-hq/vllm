@@ -64,6 +64,12 @@ class SpeculativeMethodSpec:
     supports_async_scheduling: bool = False
     """The method works with async scheduling."""
 
+    linear_attn_verify_extension: str | None = None
+    """Lazy ``"package.module:factory"`` of a callable ``(vllm_config) ->
+    LinearAttnVerifyExtension`` (see ``vllm/model_executor/layers/mamba/gdn/
+    verify_extension.py``). It lets the method verify non-chain drafts on
+    gated delta net layers of hybrid models."""
+
     def resolve_speculator_cls(self) -> type:
         return resolve_obj_by_qualname(self.speculator_cls.replace(":", "."))
 
