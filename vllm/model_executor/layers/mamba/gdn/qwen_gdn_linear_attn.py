@@ -665,6 +665,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             self._ba_stream = aux_stream()
             self._ba_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Set by process_weights_after_loading when in_proj_ba is folded into
+        # the in_proj_qkvz GEMM: (qkvz width, ba width) of the fused output.
+        self.in_proj_fused_split: tuple[int, int] | None = None
+        self._lora_enabled = vllm_config.lora_config is not None
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -921,6 +925,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
         return b, a
+
+    def _can_fuse_in_proj(self) -> bool:
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        return (
+            current_platform.is_cuda()
+            and not self._lora_enabled
+            and not self.disable_tp_for_ba_proj
+            and type(qkvz.quant_method) is UnquantizedLinearMethod
+            and type(ba.quant_method) is UnquantizedLinearMethod
+            and qkvz.bias is None
+            and ba.bias is None
+            and qkvz.weight.dim() == 2
+            and ba.weight.dim() == 2
+            and qkvz.weight.shape[1] == ba.weight.shape[1]
+            and qkvz.weight.dtype == ba.weight.dtype
+            and qkvz.weight.device == ba.weight.device
+        )
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Fold in_proj_ba into the in_proj_qkvz GEMM.
+
+        in_proj_ba has only 2 * num_v_heads / tp output features, so as its own
+        GEMM it costs a full launch (often with a split-K reduction) per layer
+        and token. Its rows are appended to in_proj_qkvz's weight, zero-padded
+        so that each row of the fused output stays 16-byte aligned, and the
+        forward slices the qkvz and ba parts out of one GEMM output. Both
+        layers keep their weights as views of the fused tensor, so the weight
+        loaders keep writing to the right rows.
+        """
+        if self.in_proj_fused_split is not None or not self._can_fuse_in_proj():
+            return
+        qkvz_w = self.in_proj_qkvz.weight
+        ba_w = self.in_proj_ba.weight
+        n_qkvz, n_ba = qkvz_w.shape[0], ba_w.shape[0]
+        n_pad = -(n_qkvz + n_ba) % (16 // qkvz_w.element_size())
+        fused = torch.cat(
+            [qkvz_w.data, ba_w.data, ba_w.data.new_zeros(n_pad, ba_w.shape[1])]
+        )
+        qkvz_w.data = fused
+        ba_w.data = fused[n_qkvz : n_qkvz + n_ba]
+        self.in_proj_fused_split = (n_qkvz, n_ba)
+
+    def project_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the (qkvz, ba) input projections, from one GEMM if fused."""
+        if self.in_proj_fused_split is None:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            return mixed_qkvz, ba
+        n_qkvz, n_ba = self.in_proj_fused_split
+        fused, _ = self.in_proj_qkvz(hidden_states)
+        return fused[..., :n_qkvz], fused[..., n_qkvz : n_qkvz + n_ba]
 
     def fix_query_key_value_ordering(
         self,
@@ -1193,7 +1250,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         qkvz_in = hidden_states if qkvz_input is None else qkvz_input
-        if self._ba_stream is None:
+        if self.in_proj_fused_split is not None:
+            # One GEMM computes both (see process_weights_after_loading).
+            mixed_qkvz, ba = self.project_input(hidden_states)
+        elif self._ba_stream is None:
             mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
             ba, _ = self.in_proj_ba(hidden_states)
         else:
