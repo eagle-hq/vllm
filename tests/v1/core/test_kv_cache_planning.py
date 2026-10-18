@@ -256,6 +256,8 @@ def new_chunked_local_attention_spec(
 def test_get_kv_cache_configs_multiple_workers():
     model_config = ModelConfig(max_model_len=16)
     vllm_config = VllmConfig(model_config=model_config)
+    # These cases exercise 2-layer groups.
+    vllm_config.cache_config.min_kv_cache_group_layers = 1
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     vllm_config.cache_config.prefix_cache_retention_interval = None
 
@@ -830,6 +832,8 @@ def test_get_kv_cache_config_one_worker():
     # pass max_model_len to pass check_enough_kv_cache_memory
     model_config = ModelConfig(max_model_len=16)
     vllm_config = VllmConfig(model_config=model_config)
+    # These cases exercise 2-layer groups.
+    vllm_config.cache_config.min_kv_cache_group_layers = 2
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     vllm_config.cache_config.prefix_cache_retention_interval = None
 
@@ -977,7 +981,9 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # 3 full + 7 sliding, pad to 3 full + 9 sliding
+    # 3 full + 7 sliding. At max_model_len=16 a sliding window layer's worst
+    # case (2 blocks) exceeds full attention's (1 block), so pad to 4 full +
+    # 8 sliding rather than 3 full + 9 sliding.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(),
         "layer_2": new_kv_cache_spec(),
@@ -994,40 +1000,36 @@ def test_get_kv_cache_config_one_worker():
         vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 3 * 32]
     )[0]
     assert kv_cache_config_hybrid == KVCacheConfig(
-        num_blocks=32,
+        num_blocks=24,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=mem_per_block_per_layer * 32 * 3,
+                size=mem_per_block_per_layer * 24 * 4,
                 layers=["layer_1", "layer_2", "layer_3"],
-                layer_stride=mem_per_block_per_layer * 32,
+                layer_stride=mem_per_block_per_layer * 24,
                 block_stride=mem_per_block_per_layer,
             ),
             KVCacheTensor(
-                size=mem_per_block_per_layer * 32 * 3,
-                layers=["layer_4", "layer_7", "layer_10"],
-                layer_stride=mem_per_block_per_layer * 32,
+                size=mem_per_block_per_layer * 24 * 4,
+                layers=["layer_4", "layer_6", "layer_8", "layer_10"],
+                layer_stride=mem_per_block_per_layer * 24,
                 block_stride=mem_per_block_per_layer,
             ),
             KVCacheTensor(
-                size=mem_per_block_per_layer * 32 * 3,
-                layers=["layer_5", "layer_8"],
-                layer_stride=mem_per_block_per_layer * 32,
-                block_stride=mem_per_block_per_layer,
-            ),
-            KVCacheTensor(
-                size=mem_per_block_per_layer * 32 * 3,
-                layers=["layer_6", "layer_9"],
-                layer_stride=mem_per_block_per_layer * 32,
+                size=mem_per_block_per_layer * 24 * 4,
+                layers=["layer_5", "layer_7", "layer_9"],
+                layer_stride=mem_per_block_per_layer * 24,
                 block_stride=mem_per_block_per_layer,
             ),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(["layer_1", "layer_2", "layer_3"], new_kv_cache_spec()),
             KVCacheGroupSpec(
-                ["layer_4", "layer_7", "layer_10"], new_sliding_window_spec()
+                ["layer_4", "layer_6", "layer_8", "layer_10"],
+                new_sliding_window_spec(),
             ),
-            KVCacheGroupSpec(["layer_5", "layer_8"], new_sliding_window_spec()),
-            KVCacheGroupSpec(["layer_6", "layer_9"], new_sliding_window_spec()),
+            KVCacheGroupSpec(
+                ["layer_5", "layer_7", "layer_9"], new_sliding_window_spec()
+            ),
         ],
     )
 
@@ -1352,7 +1354,68 @@ def _grouping_config():
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
         cache_config=cache_config,
+        model_config=SimpleNamespace(max_model_len=32768),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        max_in_flight_tokens=256,
     )
+
+
+@pytest.mark.parametrize(
+    "num_full,num_sw,num_draft_sw,min_group_layers,expected_group_size",
+    [
+        # A lone drafter layer must not force one group per layer.
+        (10, 30, 1, 2, 2),
+        (10, 30, 1, 3, 5),
+        # gpt-oss + eagle: pad sw 12 -> 13 rather than full 13 -> 24.
+        (13, 12, 0, 3, 13),
+        # Gemma3-27B: pad sliding window rather than full attention.
+        (10, 52, 0, 3, 5),
+        # MiMo + MTP: no padding.
+        (9, 39, 5, 3, 3),
+    ],
+)
+def test_hybrid_group_size_selection(
+    num_full, num_sw, num_draft_sw, min_group_layers, expected_group_size
+):
+    specs = {
+        **{f"full.{i}": new_kv_cache_spec() for i in range(num_full)},
+        **{f"sw.{i}": new_sliding_window_spec() for i in range(num_sw)},
+        **{
+            f"draft.{i}": new_sliding_window_spec(sliding_window=1024)
+            for i in range(num_draft_sw)
+        },
+    }
+    config = _grouping_config()
+    config.cache_config.min_kv_cache_group_layers = min_group_layers
+    groups = get_kv_cache_groups(config, specs)
+    assert max(len(group.layer_names) for group in groups) == expected_group_size
+
+
+@pytest.mark.parametrize("min_group_layers, expected_groups", [(1, 65), (3, 23)])
+def test_drafter_layer_with_larger_page_does_not_force_per_layer_groups(
+    min_group_layers, expected_groups
+):
+    # 48 mamba + 16 full attention target layers and one drafter full attention
+    # layer with 5x the target's KV bytes per token. Unifying the page size
+    # gives the target layers a 5x larger block size, so the drafter layer is a
+    # bucket of its own.
+    target = new_kv_cache_spec(num_kv_heads=1, head_size=256, dtype=torch.bfloat16)
+    draft = new_kv_cache_spec(num_kv_heads=10, head_size=128, dtype=torch.bfloat16)
+    mamba = new_mamba_spec(
+        block_size=32768,
+        shapes=((target.page_size_bytes // 4,),),
+        dtypes=(torch.bfloat16,),
+    )
+    specs = {
+        **{f"mamba.{i}": mamba for i in range(48)},
+        **{f"target.{i}": target for i in range(16)},
+        "draft": draft,
+    }
+    config = _grouping_config()
+    config.cache_config.min_kv_cache_group_layers = min_group_layers
+    groups = get_kv_cache_groups(config, specs)
+    assert len(groups) == expected_groups
+    assert sorted(name for g in groups for name in g.layer_names) == sorted(specs)
 
 
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
@@ -1952,9 +2015,15 @@ def _spec_decode_grouping_config(method="dspark", model_type=None):
         cache_config=SimpleNamespace(
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
-            )
+            ),
+            min_kv_cache_group_layers=3,
+            mamba_cache_mode="none",
         ),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type), max_model_len=4096
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        max_in_flight_tokens=256,
         speculative_config=SimpleNamespace(
             method=method,
             use_eagle=lambda: True,
