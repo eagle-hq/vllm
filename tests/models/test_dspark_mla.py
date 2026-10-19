@@ -420,6 +420,12 @@ def test_k3_dspark_mla_kv_cache_spec_groups_with_target_mla():
     kv_cache_spec = {f"model.layers.{i}.attn": target_spec for i in range(24)}
     kv_cache_spec |= {f"draft.layers.{i}.attn": draft_spec for i in range(5)}
 
-    groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    grouping_config = SimpleNamespace(
+        cache_config=SimpleNamespace(min_kv_cache_group_layers=3),
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        max_in_flight_tokens=256,
+    )
+    groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec, grouping_config)
     assert len(groups) == 1
     assert len(groups[0].layer_names) == 29
