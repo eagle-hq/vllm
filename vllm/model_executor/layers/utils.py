@@ -101,14 +101,21 @@ class _FlashInferBf16Backend:
     can_implement: _FlashInferBf16RuntimeCheck
 
 
+@functools.cache
+def _is_blackwell_cuda() -> bool:
+    # Queried once: the platform asks the driver for the capability on every
+    # call, which costs an eager prefill more host time than its GEMMs.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
 def _can_use_flashinfer_cutedsl_bf16(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> bool:
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
-    ):
+    if not _is_blackwell_cuda():
         return False
     if x.ndim < 1 or weight.ndim != 2:
         return False
@@ -165,6 +172,15 @@ def _get_flashinfer_bf16_backend(vllm_backend: str) -> _FlashInferBf16Backend:
     return backend_spec
 
 
+@functools.cache
+def flashinfer_cutedsl_bf16_max_m() -> int:
+    """Largest row count FlashInfer's ``cute-dsl`` BF16 GEMM backend has a
+    CuTe DSL kernel for; above it the backend runs cuBLASLt."""
+    from flashinfer.gemm import gemm_base
+
+    return gemm_base._CUTE_DSL_BF16_MAX_M
+
+
 def use_tgv_bf16_gemm(m: int, n: int, pdl: bool) -> bool:
     """Whether a CuTe DSL BF16 GEMM of ``m`` rows and ``n`` output features
     runs on the in-tree TGV kernel instead of FlashInfer's.
@@ -193,6 +209,11 @@ def cuda_flashinfer_bf16_gemm_impl(
     k = x.shape[-1]
     n = weight.shape[0]
     x_2d = x.view(-1, k)
+    if x_2d.shape[0] > flashinfer_cutedsl_bf16_max_m():
+        # FlashInfer has no CuTe DSL kernel for this many rows and would run
+        # cuBLASLt behind its autotuner's per-call Python dispatch, which
+        # costs an eager prefill more host time than the GEMMs take.
+        return torch.nn.functional.linear(x, weight, bias)
     if use_tgv_bf16_gemm(x_2d.shape[0], n, pdl):
         from vllm.model_executor.kernels.linear.cute_dsl.tgv_bf16 import (
             tgv_bf16_gemm,
