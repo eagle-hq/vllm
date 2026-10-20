@@ -32,6 +32,29 @@ implies that:
 * K=1 will be used when the concurrency is in range [65, 128]
 * K=0 will be used when the concurrency is in range [129, 512], i.e., no draft tokens will be produced.
 
+## Native target decoding
+
+To stop draft KV maintenance as well as draft generation, set
+`native_decode_batch_sizes` in `--speculative-config` to a list of inclusive
+`[first_batch_size, last_batch_size]` ranges. The ranges apply to scheduled
+requests, not client concurrency. An empty list or `null` leaves speculation
+unchanged. A zero `num_speculative_tokens_per_batch_size` entry alone does not
+select this path.
+
+Suspension lasts until each affected request finishes. A batch containing a
+suspended request suspends every request in that batch, even after compaction or
+preemption. Pending verification and accepted recurrent-state offsets drain
+before native target metadata and graphs take over. Drafting never resumes for
+these requests, because their skipped hidden states cannot populate draft KV.
+Fresh requests can speculate after all suspended requests finish.
+
+This path requires Model Runner V2, synchronous scheduling, and eager execution
+or full decode graphs. Prefix caching, KV transfer, DBO, context/data/pipeline
+parallelism, and recurrent replay/recovery are rejected. Piecewise graph caches
+are not isolated between native and speculative execution. Draft weights and
+allocated KV capacity remain resident, so measure the suspended configuration
+rather than assuming it has the cost of a separately loaded no-spec engine.
+
 ## Online Examples
 
 ### Dynamic SD Eagle Drafter

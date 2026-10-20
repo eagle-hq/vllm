@@ -511,6 +511,18 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    native_decode_batch_sizes: list[tuple[int, int]] | None = None
+    """Inclusive batch-size ranges selecting native target decoding in MRV2.
+
+    Unlike a zero speculative-token count, this skips draft KV maintenance.
+    Suspension is sticky by request ID until finish: merging a suspended request
+    suspends the whole batch. Already scheduled verification and accepted-state
+    offsets drain before switching to native target metadata and graphs.
+    Prefix caching, KV transfer, asynchronous scheduling, context/data/pipeline
+    parallelism, and recurrent replay/recovery modes are not supported.
+    None or an empty list preserves ordinary speculative decoding.
+    """
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""

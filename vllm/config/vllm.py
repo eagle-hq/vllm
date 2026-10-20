@@ -723,6 +723,13 @@ class VllmConfig:
             return True
 
         speculative_config = getattr(self, "speculative_config", None)
+        if getattr(speculative_config, "native_decode_batch_sizes", None):
+            if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+                raise ValueError(
+                    "Native draft suspension requires Model Runner V2; remove "
+                    "VLLM_USE_V2_MODEL_RUNNER=0."
+                )
+            return True
         if (
             speculative_config is not None
             and get_speculative_method(speculative_config.method) is not None
