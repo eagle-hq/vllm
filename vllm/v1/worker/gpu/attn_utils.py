@@ -473,7 +473,7 @@ def _metadata_reuse_key(
     if not builder.supports_update_block_table:
         return None
     if shared_attn_inputs or isinstance(attn_group.kv_cache_spec, MambaSpec):
-        return (attn_group.kv_cache_spec, type(builder))
+        return (builder.kv_cache_spec, type(builder))
     return None
 
 
@@ -539,8 +539,11 @@ def build_attn_metadata(
             for attn_group, builder, reuse_key in zip(
                 attn_groups[i], builders, reuse_keys
             ):
+                assert reuse_key is not None
                 metadata = builder.update_block_table(
-                    cached_metadata[reuse_key], block_table, slot_mapping
+                    cached_metadata[reuse_key],
+                    attn_group.map_to_kernel_block_table(block_table, ubatch_idx),
+                    slot_mapping,
                 )
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = metadata
@@ -594,7 +597,9 @@ def build_attn_metadata(
         ):
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
-                    cached_metadata[reuse_key], block_table, slot_mapping
+                    cached_metadata[reuse_key],
+                    attn_group.map_to_kernel_block_table(block_table, ubatch_idx),
+                    slot_mapping,
                 )
             elif for_cudagraph_capture:
                 metadata = attn_group.build_metadata_for_cudagraph_capture(
