@@ -204,6 +204,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.supports_update_block_table:
             # Opts into MRV2's CUDA-only aligned-index precompute.
             self.mamba_aligned_state_indices: torch.Tensor | None = None
+        # MRV2 builds from the runner's persistent per-group input block table,
+        # whose rows past the batch are already NULL_BLOCK_ID (gather_block_tables
+        # zeroes them), so the FULL-graph state indices can be views of it
+        # rather than copies into this builder's buffers. The kernels take the
+        # row stride. Aligned indices ("align") are computed per step without
+        # that padding, so they keep the staged copy.
+        self.state_indices_from_block_table = (
+            self.supports_update_block_table
+            and vllm_config.cache_config.mamba_cache_mode == "none"
+        )
 
         self.decode_cudagraph_max_bs: int = (
             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
@@ -629,11 +639,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_prefills, num_decodes, num_spec_decodes, num_spec_decode_tokens
         ):
             assert spec_sequence_masks is not None
-            self.spec_state_indices_tensor[:num_spec_decodes].copy_(
-                spec_state_indices_tensor, non_blocking=True
-            )
-            spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
-            spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
+            if self.state_indices_from_block_table:
+                spec_state_indices_tensor = block_table_tensor[
+                    :batch_size, : self.num_spec + 1
+                ]
+            else:
+                self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+                    spec_state_indices_tensor, non_blocking=True
+                )
+                spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
+                spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
                 spec_sequence_masks[:num_spec_decodes], non_blocking=True
@@ -668,13 +683,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
-            self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor, non_blocking=True
-            )
-            non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
-                :batch_size
-            ]
-            non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
+            if self.state_indices_from_block_table:
+                non_spec_state_indices_tensor = block_table_tensor[:batch_size, 0]
+            else:
+                self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                    non_spec_state_indices_tensor, non_blocking=True
+                )
+                non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                    :batch_size
+                ]
+                non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
@@ -779,20 +797,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert m.spec_state_indices_tensor is not None
             batch_size = m.spec_state_indices_tensor.shape[0]
-            self.spec_state_indices_tensor[: m.num_spec_decodes].copy_(
-                spec_indices, non_blocking=True
-            )
-            spec_indices = self.spec_state_indices_tensor[:batch_size]
-            spec_indices[m.num_spec_decodes :].fill_(NULL_BLOCK_ID)
+            if self.state_indices_from_block_table:
+                spec_indices = blk_table[:batch_size, : self.num_spec + 1]
+            else:
+                self.spec_state_indices_tensor[: m.num_spec_decodes].copy_(
+                    spec_indices, non_blocking=True
+                )
+                spec_indices = self.spec_state_indices_tensor[:batch_size]
+                spec_indices[m.num_spec_decodes :].fill_(NULL_BLOCK_ID)
 
         if self._stage_decode(m.num_prefills, m.num_decodes, m.num_spec_decodes):
             assert m.non_spec_state_indices_tensor is not None
             batch_size = m.non_spec_state_indices_tensor.shape[0]
-            self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
-                non_spec_indices, non_blocking=True
-            )
-            non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
-            non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
+            if self.state_indices_from_block_table:
+                non_spec_indices = blk_table[:batch_size, 0]
+            else:
+                self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
+                    non_spec_indices, non_blocking=True
+                )
+                non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
+                non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
 
         return replace(
             m,

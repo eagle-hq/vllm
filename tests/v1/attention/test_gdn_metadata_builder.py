@@ -23,7 +23,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
     plan_flashinfer_checkpoints,
 )
-from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -261,6 +264,46 @@ def test_update_block_table_matches_build(
         # FULL graph state indices land in this group's own buffers.
         if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
             assert actual.data_ptr() == getattr(dst, field).data_ptr()
+
+
+@pytest.mark.parametrize("spec", [True, False])
+def test_full_cudagraph_state_indices_view_the_persistent_block_table(spec: bool):
+    """Under MRV2 (mode "none") the FULL-graph state indices are views of the
+    block table build() was given, for build() and for update_block_table():
+    no copy into the builder's buffers. A NULL row (as gather_block_tables
+    leaves the rows past the batch) is passed through."""
+    num_spec = 2 if spec else 0
+    src, dst = (_create_gdn_builder(num_spec, full_cuda_graph=True) for _ in range(2))
+    for builder in (src, dst):
+        builder.vllm_config.cache_config.mamba_cache_mode = "none"
+        builder.state_indices_from_block_table = True
+    batch = BatchSpec(seq_lens=[80, 96, 16], query_lens=[num_spec + 1] * 3)
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    table = common.block_table_tensor
+    table[2] = NULL_BLOCK_ID
+    kwargs: dict = {}
+    if spec:
+        kwargs["num_decode_draft_tokens_cpu"] = torch.full((3,), 2, dtype=torch.int32)
+        kwargs["num_accepted_tokens"] = torch.ones(3, dtype=torch.int32)
+    meta = src.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+    field = "spec_state_indices_tensor" if spec else "non_spec_state_indices_tensor"
+
+    def expected(blk_table: torch.Tensor) -> torch.Tensor:
+        return blk_table[:3, : num_spec + 1] if spec else blk_table[:3, 0]
+
+    indices = getattr(meta, field)
+    assert indices.data_ptr() == table.data_ptr()
+    torch.testing.assert_close(indices, expected(table))
+    assert (indices[2] == NULL_BLOCK_ID).all()
+
+    other = table + 5
+    other[2] = NULL_BLOCK_ID
+    regathered = getattr(
+        dst.update_block_table(meta, other, common.slot_mapping), field
+    )
+    assert regathered.data_ptr() == other.data_ptr()
+    torch.testing.assert_close(regathered, expected(other))
+    assert getattr(dst, field).data_ptr() != regathered.data_ptr()
 
 
 def test_has_initial_state_after_reclassification():
