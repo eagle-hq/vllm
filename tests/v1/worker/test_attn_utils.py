@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     SparseCacheRole,
     compute_layout_strides,
@@ -924,3 +925,61 @@ def test_packed_token_cache_cannot_be_split():
     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]
     with pytest.raises(ValueError, match="cannot be split"):
         map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])
+
+
+class _MambaBuilder:
+    """A builder whose later groups re-gather state indices from the first."""
+
+    requires_block_table_width = False
+    supports_update_block_table = True
+    builds = 0
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        self.kv_cache_spec = kv_cache_spec
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        _MambaBuilder.builds += 1
+        return common_attn_metadata.block_table_tensor
+
+    def update_block_table(self, metadata, blk_table, slot_mapping):
+        return blk_table
+
+
+def test_build_attn_metadata_reused_mamba_groups_skip_batch_metadata():
+    """Mamba groups past the first of their spec need neither batch-level
+    metadata nor the model's per-group extras: they only re-gather state
+    indices from the first group's metadata."""
+    _MambaBuilder.builds = 0
+    spec = MambaSpec(block_size=64, shapes=((4, 8),), dtypes=(torch.float32,))
+    backend = SimpleNamespace(get_builder_cls=lambda: _MambaBuilder)
+    groups = []
+    for i in range(3):
+        group = AttentionGroup(backend, [f"layer.{i}"], spec, i)
+        group.metadata_builders = [_MambaBuilder(spec, group.layer_names, None, "cpu")]
+        groups.append([group])
+    block_tables = tuple(torch.full((2, 4), i, dtype=torch.int32) for i in range(3))
+    model_specific = MagicMock()
+    model_specific.get_extra_common_attn_kwargs.return_value = {}
+    model_specific.get_extra_attn_kwargs.return_value = {}
+
+    attn_metadata = attn_utils.build_attn_metadata(
+        attn_groups=groups,
+        num_reqs=2,
+        num_tokens=2,
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        max_seq_len=7,
+        block_tables=block_tables,
+        slot_mappings=torch.zeros(3, 2, dtype=torch.int64),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None] * 3),
+        model_specific_attn_metadata=model_specific,
+    )
+
+    assert _MambaBuilder.builds == 1
+    for i in range(3):
+        assert attn_metadata[f"layer.{i}"] is block_tables[i]
+    # The batch-level metadata (and the model's extras) are built once.
+    assert model_specific.get_extra_common_attn_kwargs.call_count == 1
+    assert model_specific.get_extra_attn_kwargs.call_count == 1

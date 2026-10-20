@@ -21,6 +21,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
@@ -458,6 +459,19 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+def _metadata_reuse_key(
+    attn_group: AttentionGroup, builder: AttentionMetadataBuilder
+) -> tuple[KVCacheSpec, type] | None:
+    """Mamba groups with the same spec and builder differ only in their state
+    indices, so later groups re-gather those from the first group's metadata
+    (also at capture, so FULL graphs share the batch-level buffers)."""
+    if builder.supports_update_block_table and isinstance(
+        attn_group.kv_cache_spec, MambaSpec
+    ):
+        return (attn_group.kv_cache_spec, type(builder))
+    return None
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -496,9 +510,6 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
-    # Mamba groups with the same spec and builder differ only in their state
-    # indices, so later groups re-gather those from the first group's metadata.
-    # Also at capture, so FULL graphs share the batch-level buffers.
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
@@ -506,6 +517,25 @@ def build_attn_metadata(
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        builders = [
+            attn_group.get_metadata_builder(ubatch_idx) for attn_group in attn_groups[i]
+        ]
+        reuse_keys = [
+            _metadata_reuse_key(attn_group, builder)
+            for attn_group, builder in zip(attn_groups[i], builders)
+        ]
+        if all(key in cached_metadata for key in reuse_keys):
+            # Every layer of this group re-gathers its state indices from an
+            # earlier group's metadata: no batch-level metadata to build.
+            for attn_group, builder, reuse_key in zip(
+                attn_groups[i], builders, reuse_keys
+            ):
+                metadata = builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+            continue
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
@@ -550,13 +580,9 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            reuse_key = None
-            if attn_metadata_builder.supports_update_block_table and isinstance(
-                attn_group.kv_cache_spec, MambaSpec
-            ):
-                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+        for attn_group, attn_metadata_builder, reuse_key in zip(
+            attn_groups[i], builders, reuse_keys
+        ):
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
