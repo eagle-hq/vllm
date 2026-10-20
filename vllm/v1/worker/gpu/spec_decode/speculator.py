@@ -122,8 +122,12 @@ class BaseSpeculator(ABC):
         holds the accepted tokens then the bonus token for each request,
         ``num_sampled`` counts them, and ``num_rejected`` is the number of
         scheduled query tokens that were not committed (so that
-        ``num_computed_tokens`` advances by ``num_sampled``). A verifier for
-        trees or other non-chain drafts can do that here.
+        ``num_computed_tokens`` advances by ``num_sampled``). Row ``k`` of a
+        request in ``logprobs_tensors`` and ``sampling_mask_tensors`` belongs to
+        its sampled token ``k``: ``RejectionSampler`` takes them from the
+        request's first logits rows, which holds only when the accepted drafts
+        are a prefix of the verified ones. A verifier for trees or other
+        non-chain drafts can do that here.
         """
         return None
 
