@@ -583,12 +583,15 @@ def test_mamba_page_covers_a_drafter_with_more_kv_per_token(draft_kv_heads):
     Platform._align_hybrid_block_size(vllm_config, _mock_backend([MultipleOf(16)]))
 
     model_config = vllm_config.model_config
-    target_page = cache_config.block_size * FullAttentionSpec(
-        block_size=1,
-        num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
-        head_size=model_config.get_head_size(),
-        dtype=model_config.dtype,
-    ).page_size_bytes
+    target_page = (
+        cache_config.block_size
+        * FullAttentionSpec(
+            block_size=1,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_size=model_config.get_head_size(),
+            dtype=model_config.dtype,
+        ).page_size_bytes
+    )
     draft_page = cache_config.block_size * 2 * draft_kv_heads * 128 * 2
     assert cache_config.mamba_page_size_padded == max(target_page, draft_page)
 
