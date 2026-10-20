@@ -1347,9 +1347,9 @@ def get_nvcc_cuda_version() -> Version:
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
-    # Release branch eagle/v1-rc2: upstream's version of the base commit (074c83a,
-    # 0.32.0rc1.dev283+g074c83a09) with the local label eagle.2.
-    if env_version := os.getenv("VLLM_VERSION_OVERRIDE", "0.32.0rc1.dev283+eagle.2"):
+    # Release branch eagle/v1-rc3: upstream's version of the base commit (074c83a,
+    # 0.32.0rc1.dev283+g074c83a09) with the local label eagle.3.
+    if env_version := os.getenv("VLLM_VERSION_OVERRIDE", "0.32.0rc1.dev283+eagle.3"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(
