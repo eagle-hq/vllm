@@ -87,3 +87,31 @@ def test_flashinfer_cutedsl_routes_decode_to_tgv() -> None:
     assert torch.equal(
         actual.view(8, 8704), tgv_bf16_gemm(x.view(8, 5120), weight, None, pdl=True)
     )
+
+
+def test_flashinfer_cutedsl_routes_prefill_to_torch(monkeypatch) -> None:
+    """Rows past FlashInfer's CuTe DSL range run torch's GEMM directly, not
+    FlashInfer's cuBLASLt fallback behind its autotuner."""
+    max_m = 32
+    monkeypatch.setattr(layer_utils, "flashinfer_cutedsl_bf16_max_m", lambda: max_m)
+    monkeypatch.setattr(
+        layer_utils,
+        "_get_flashinfer_bf16_backend",
+        lambda backend: layer_utils._FlashInferBf16Backend(
+            flashinfer_backend="cute-dsl",
+            is_supported=lambda: True,
+            can_implement=lambda x, weight, bias: True,
+        ),
+    )
+
+    def no_flashinfer(*args, **kwargs):
+        raise AssertionError("FlashInfer must not run a prefill-sized GEMM")
+
+    monkeypatch.setattr(layer_utils, "flashinfer_bf16_mm", no_flashinfer)
+    torch.manual_seed(0)
+    x = torch.randn(1, max_m + 1, 256, dtype=torch.bfloat16)
+    weight = torch.randn(512, 256, dtype=torch.bfloat16) * 0.02
+    actual = layer_utils.cuda_flashinfer_bf16_gemm_impl(
+        x, weight, None, True, "flashinfer_cutedsl"
+    )
+    assert torch.equal(actual, F.linear(x, weight))
