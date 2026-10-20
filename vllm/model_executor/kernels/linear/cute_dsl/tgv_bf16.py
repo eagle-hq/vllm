@@ -23,6 +23,7 @@ Warp specialization (8 warps, 256 threads per CTA):
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
@@ -1072,7 +1073,7 @@ def _bmm_bias(
 
 # Compiled kernels by config. The kernel marks its layouts dynamic, so one
 # binary serves every (M, N, K) with this module's fixed operand layouts.
-_COMPILED: dict[tuple, object] = {}
+_COMPILED: dict[tuple, Callable[..., None]] = {}
 
 
 def _compile(
