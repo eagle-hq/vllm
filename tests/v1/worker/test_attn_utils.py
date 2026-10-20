@@ -927,8 +927,9 @@ def test_packed_token_cache_cannot_be_split():
         map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])
 
 
-class _MambaBuilder:
-    """A builder whose later groups re-gather state indices from the first."""
+class _ReusableBuilder:
+    """A builder whose later groups re-apply their block table to the first
+    group's metadata."""
 
     requires_block_table_width = False
     supports_update_block_table = True
@@ -938,30 +939,35 @@ class _MambaBuilder:
         self.kv_cache_spec = kv_cache_spec
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        _MambaBuilder.builds += 1
+        _ReusableBuilder.builds += 1
         return common_attn_metadata.block_table_tensor
 
     def update_block_table(self, metadata, blk_table, slot_mapping):
         return blk_table
 
 
-def test_build_attn_metadata_reused_mamba_groups_skip_batch_metadata():
-    """Mamba groups past the first of their spec need neither batch-level
-    metadata nor the model's per-group extras: they only re-gather state
-    indices from the first group's metadata."""
-    _MambaBuilder.builds = 0
-    spec = MambaSpec(block_size=64, shapes=((4, 8),), dtypes=(torch.float32,))
-    backend = SimpleNamespace(get_builder_cls=lambda: _MambaBuilder)
-    groups = []
-    for i in range(3):
-        group = AttentionGroup(backend, [f"layer.{i}"], spec, i)
-        group.metadata_builders = [_MambaBuilder(spec, group.layer_names, None, "cpu")]
-        groups.append([group])
-    block_tables = tuple(torch.full((2, 4), i, dtype=torch.int32) for i in range(3))
+def _model_specific(per_group: bool) -> MagicMock:
     model_specific = MagicMock()
     model_specific.get_extra_common_attn_kwargs.return_value = {}
     model_specific.get_extra_attn_kwargs.return_value = {}
+    model_specific.per_group_common_attn_kwargs = per_group
+    return model_specific
 
+
+def _build_three_groups(spec, **kwargs):
+    _ReusableBuilder.builds = 0
+    backend = SimpleNamespace(get_builder_cls=lambda: _ReusableBuilder)
+    groups = []
+    for i in range(3):
+        group = AttentionGroup(backend, [f"layer.{i}"], spec, i)
+        group.metadata_builders = [
+            _ReusableBuilder(spec, group.layer_names, None, "cpu")
+        ]
+        groups.append([group])
+    block_tables = tuple(torch.full((2, 4), i, dtype=torch.int32) for i in range(3))
+    model_specific = kwargs.pop("model_specific_attn_metadata", None)
+    if model_specific is None:
+        model_specific = _model_specific(per_group=False)
     attn_metadata = attn_utils.build_attn_metadata(
         attn_groups=groups,
         num_reqs=2,
@@ -975,11 +981,45 @@ def test_build_attn_metadata_reused_mamba_groups_skip_batch_metadata():
         slot_mappings=torch.zeros(3, 2, dtype=torch.int64),
         kv_cache_config=SimpleNamespace(kv_cache_groups=[None] * 3),
         model_specific_attn_metadata=model_specific,
+        **kwargs,
     )
-
-    assert _MambaBuilder.builds == 1
     for i in range(3):
         assert attn_metadata[f"layer.{i}"] is block_tables[i]
-    # The batch-level metadata (and the model's extras) are built once.
+    return model_specific
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        MambaSpec(block_size=64, shapes=((4, 8),), dtypes=(torch.float32,)),
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+        ),
+    ],
+    ids=["mamba", "attention"],
+)
+def test_build_attn_metadata_reused_groups_skip_batch_metadata(spec):
+    """Groups past the first of their spec need neither batch-level metadata
+    nor the model's per-group extras: they only re-apply their block table
+    to the first group's metadata."""
+    model_specific = _build_three_groups(spec)
+    assert _ReusableBuilder.builds == 1
     assert model_specific.get_extra_common_attn_kwargs.call_count == 1
     assert model_specific.get_extra_attn_kwargs.call_count == 1
+
+
+def test_build_attn_metadata_per_group_inputs_keep_attention_groups_apart():
+    """Attention groups with a per-group causal or per-group model extras
+    build their own metadata; Mamba groups, which take neither, still share."""
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    _build_three_groups(attention, causal={0: True, 1: False})
+    assert _ReusableBuilder.builds == 3
+    _build_three_groups(
+        attention, model_specific_attn_metadata=_model_specific(per_group=True)
+    )
+    assert _ReusableBuilder.builds == 3
+    mamba = MambaSpec(block_size=64, shapes=((4, 8),), dtypes=(torch.float32,))
+    _build_three_groups(mamba, causal={0: True, 1: False})
+    assert _ReusableBuilder.builds == 1

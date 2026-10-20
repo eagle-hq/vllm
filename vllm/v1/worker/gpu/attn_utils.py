@@ -460,14 +460,19 @@ def build_slot_mappings_by_layer(
 
 
 def _metadata_reuse_key(
-    attn_group: AttentionGroup, builder: AttentionMetadataBuilder
+    attn_group: AttentionGroup,
+    builder: AttentionMetadataBuilder,
+    shared_attn_inputs: bool,
 ) -> tuple[KVCacheSpec, type] | None:
-    """Mamba groups with the same spec and builder differ only in their state
-    indices, so later groups re-gather those from the first group's metadata
-    (also at capture, so FULL graphs share the batch-level buffers)."""
-    if builder.supports_update_block_table and isinstance(
-        attn_group.kv_cache_spec, MambaSpec
-    ):
+    """Groups with the same spec and builder type share the batch-level
+    metadata (also at capture, so FULL graphs share its buffers) and differ
+    only in what update_block_table re-applies: the block table and slot
+    mapping, and for Mamba the state indices gathered from them. Attention
+    groups also take the per-group causal and model-specific inputs, so they
+    share only when those are the same for every group."""
+    if not builder.supports_update_block_table:
+        return None
+    if shared_attn_inputs or isinstance(attn_group.kv_cache_spec, MambaSpec):
         return (attn_group.kv_cache_spec, type(builder))
     return None
 
@@ -511,6 +516,10 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    shared_attn_inputs = isinstance(causal, (bool, torch.Tensor)) and (
+        model_specific_attn_metadata is None
+        or not model_specific_attn_metadata.per_group_common_attn_kwargs
+    )
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -521,12 +530,12 @@ def build_attn_metadata(
             attn_group.get_metadata_builder(ubatch_idx) for attn_group in attn_groups[i]
         ]
         reuse_keys = [
-            _metadata_reuse_key(attn_group, builder)
+            _metadata_reuse_key(attn_group, builder, shared_attn_inputs)
             for attn_group, builder in zip(attn_groups[i], builders)
         ]
         if all(key in cached_metadata for key in reuse_keys):
-            # Every layer of this group re-gathers its state indices from an
-            # earlier group's metadata: no batch-level metadata to build.
+            # Every layer of this group reuses an earlier group's metadata:
+            # no batch-level metadata to build.
             for attn_group, builder, reuse_key in zip(
                 attn_groups[i], builders, reuse_keys
             ):
