@@ -165,6 +165,20 @@ def _get_flashinfer_bf16_backend(vllm_backend: str) -> _FlashInferBf16Backend:
     return backend_spec
 
 
+def use_tgv_bf16_gemm(m: int, n: int, pdl: bool) -> bool:
+    """Whether a CuTe DSL BF16 GEMM of ``m`` rows and ``n`` output features
+    runs on the in-tree TGV kernel instead of FlashInfer's.
+
+    Decode-sized GEMMs only stream the weight. Launched with PDL, TGV streams
+    it into shared memory and prefetches the rest into L2 while the previous
+    kernel still runs; FlashInfer's CuTe DSL kernels stop at their shared
+    memory stages. That wins from 2 to 16 rows (speculative verify and
+    drafts); at one row FlashInfer's kernels are as fast, and narrower ``n``
+    leaves TGV too few CTAs.
+    """
+    return pdl and 2 <= m <= 16 and n >= 1024
+
+
 def cuda_flashinfer_bf16_gemm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -179,13 +193,20 @@ def cuda_flashinfer_bf16_gemm_impl(
     k = x.shape[-1]
     n = weight.shape[0]
     x_2d = x.view(-1, k)
-    out_2d = flashinfer_bf16_mm(
-        x_2d,
-        weight.t(),
-        bias,
-        pdl,
-        backend_spec.flashinfer_backend,
-    )
+    if use_tgv_bf16_gemm(x_2d.shape[0], n, pdl):
+        from vllm.model_executor.kernels.linear.cute_dsl.tgv_bf16 import (
+            tgv_bf16_gemm,
+        )
+
+        out_2d = tgv_bf16_gemm(x_2d, weight, bias, pdl=pdl)
+    else:
+        out_2d = flashinfer_bf16_mm(
+            x_2d,
+            weight.t(),
+            bias,
+            pdl,
+            backend_spec.flashinfer_backend,
+        )
     return out_2d.view(*x.shape[:-1], n)
 
 
