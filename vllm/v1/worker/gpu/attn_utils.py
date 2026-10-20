@@ -256,6 +256,10 @@ def init_attn_backend(
             if attn_layers[layer_name].is_draft_layer:
                 # Merged group specs drop the per-layer draft tag.
                 layer_kv_cache_spec = replace(layer_kv_cache_spec, is_draft=True)
+            if isinstance(layer_kv_cache_spec, AttentionSpec):
+                layer_kv_cache_spec = replace(
+                    layer_kv_cache_spec, num_query_heads=num_heads_q or None
+                )
             key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
             if key not in group_map:
                 group_map[key] = AttentionGroup(
