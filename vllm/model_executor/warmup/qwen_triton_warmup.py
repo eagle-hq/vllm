@@ -107,10 +107,13 @@ def _gate_row_stride(layer: object) -> int | None:
     """Row stride of the gate the spec-decode gated norm reads in place."""
     if not getattr(layer, "enable_fused_gdn_spec_decode", False):
         return None
-    weight = getattr(getattr(layer, "in_proj_qkvz", None), "weight", None)
+    # The gate is a column slice of the input projection output: one GEMM on
+    # the fused buffer when in_proj_ba is folded in, else in_proj_qkvz's.
+    weight = getattr(layer, "in_proj_fused_weight", None)
+    if weight is None:
+        weight = getattr(getattr(layer, "in_proj_qkvz", None), "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
         return None
-    # The gate is a column slice of the in_proj_qkvz output.
     return int(weight.shape[0])
 
 
