@@ -56,6 +56,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -630,6 +631,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # the in_proj_qkvz GEMM: (qkvz width, ba width) of the fused output.
         self.in_proj_fused_split: tuple[int, int] | None = None
         self._lora_enabled = vllm_config.lora_config is not None
+        self._in_proj_fused_gemm = dispatch_unquantized_gemm(
+            vllm_config.kernel_config.linear_backend
+        )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -887,6 +891,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
         return (
             current_platform.is_cuda()
+            # The fused GEMM bypasses the linear method's batch-invariant path.
+            and not envs.VLLM_BATCH_INVARIANT
             and not self._lora_enabled
             and not self.disable_tp_for_ba_proj
             and type(qkvz.quant_method) is UnquantizedLinearMethod
@@ -905,14 +911,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         in_proj_ba has only 2 * num_v_heads / tp output features, so as its own
         GEMM it costs a full launch (often with a split-K reduction) per layer
-        and token. Its rows are appended to in_proj_qkvz's weight, zero-padded
-        to a multiple of 16 rows, and the forward slices the qkvz and ba parts
-        out of one GEMM output. The padding keeps the fused output's row stride
-        divisible by 16 like an unfused qkvz output, so Triton kernels that read
-        these views (the spec-decode conv, for one) keep the stride
-        specialization that warmup and graph capture compiled. Both
-        layers keep their weights as views of the fused tensor, so the weight
-        loaders keep writing to the right rows.
+        and token. Its rows are stacked under in_proj_qkvz's in one buffer,
+        zero-padded to a multiple of 16 rows, and the forward runs one GEMM on
+        that buffer and slices the qkvz and ba parts out of its output. The
+        padding keeps the fused output's row stride divisible by 16 like an
+        unfused qkvz output, so Triton kernels that read these views (the
+        spec-decode conv, for one) keep the stride specialization that warmup
+        and graph capture compiled. Both layers keep their weights, at their
+        checkpoint shapes, as views of the buffer, so the weight loaders (a
+        later reload included) keep writing to the right rows.
         """
         if self.in_proj_fused_split is not None or not self._can_fuse_in_proj():
             return
@@ -923,8 +930,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         fused = torch.cat(
             [qkvz_w.data, ba_w.data, ba_w.data.new_zeros(n_pad, ba_w.shape[1])]
         )
-        qkvz_w.data = fused
+        qkvz_w.data = fused[:n_qkvz]
         ba_w.data = fused[n_qkvz : n_qkvz + n_ba]
+        # Non-persistent, as it aliases the two weights (cf. Mamba2's
+        # conv_weights): checkpoints and reloads still see only the weights.
+        self.register_buffer("in_proj_fused_weight", fused, persistent=False)
         self.in_proj_fused_split = (n_qkvz, n_ba)
 
     def project_input(
@@ -936,7 +946,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ba, _ = self.in_proj_ba(hidden_states)
             return mixed_qkvz, ba
         n_qkvz, n_ba = self.in_proj_fused_split
-        fused, _ = self.in_proj_qkvz(hidden_states)
+        fused = self._in_proj_fused_gemm(
+            self.in_proj_qkvz, hidden_states, self.in_proj_fused_weight
+        )
         return fused[..., :n_qkvz], fused[..., n_qkvz : n_qkvz + n_ba]
 
     def fix_query_key_value_ordering(
