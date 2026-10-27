@@ -110,6 +110,8 @@ class SymmMemCommunicator:
             )
             return
         self.force_multimem = force_multimem
+        # Every symm-mem op of this group runs on this one stream; see all_reduce.
+        self.stream = torch.cuda.Stream(device=self.device)
         self.disabled = False
         if envs.VLLM_BATCH_INVARIANT:
             self.disabled = True
@@ -131,6 +133,23 @@ class SymmMemCommunicator:
             return None
         if out is None:
             out = torch.empty_like(inp)
+        # The symm-mem barriers match ops by issue order across ranks, but CUDA
+        # does not order kernels across streams. vLLM issues all-reduces from
+        # several streams (profiling, warmup, one fresh stream per graph
+        # capture), so one rank can run two of them in the opposite order, and
+        # once the ranks are skewed (e.g. one rank JIT-builds a kernel) the
+        # whole group spins forever (pytorch/pytorch#189228). Run every op on
+        # one stream, fenced against the caller's stream; this also keeps an op
+        # from overwriting the shared buffer while another still reads it.
+        caller = torch.cuda.current_stream()
+        self.stream.wait_stream(caller)
+        with torch.cuda.stream(self.stream):
+            self._all_reduce_buffer(inp)
+        caller.wait_stream(self.stream)
+        out.copy_(self.buffer[: inp.numel()].view(out.shape))
+        return out
+
+    def _all_reduce_buffer(self, inp: torch.Tensor) -> None:
         self.buffer[: inp.numel()].copy_(inp.view(-1))
 
         # Determine which algorithm to use
@@ -152,5 +171,3 @@ class SymmMemCommunicator:
             torch.ops.symm_mem.two_shot_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
-        out.copy_(self.buffer[: inp.numel()].view(out.shape))
-        return out
