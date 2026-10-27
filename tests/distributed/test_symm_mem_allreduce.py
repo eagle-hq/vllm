@@ -119,6 +119,87 @@ def test_symm_mem_allreduce(
             pytest.skip(val)
 
 
+def symm_mem_two_streams_worker(local_rank: int, world_size: int, port: int, q):
+    """All-reduces issued from two caller streams while one rank lags at a time
+    (the startup pattern: profiling, warmup and capture streams, one rank
+    JIT-building a kernel). Before the communicator ran every op on its own
+    stream, B300s returned wrong sums from iteration 49 on: max error 8e26
+    at TP8 (multimem) and 6.1 at TP2 (two-shot) over 5000 iterations. The
+    barrier can also deadlock (pytorch/pytorch#189228)."""
+    import time
+
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world_size))
+    with set_current_vllm_config(config):
+        device = torch.device(f"cuda:{local_rank}")
+        torch.accelerator.set_device_index(device)
+        update_environment_variables(
+            {
+                "RANK": str(local_rank),
+                "LOCAL_RANK": str(local_rank),
+                "WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": str(port),
+            }
+        )
+        init_distributed_environment()
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+        comm = typing.cast(
+            CudaCommunicator, get_tp_group().device_communicator
+        ).symm_mem_comm
+        if comm is None or comm.disabled:
+            q.put("skip: SymmMemCommunicator is not available or disabled.")
+            return
+        x = torch.randn(32 * 4096, dtype=torch.bfloat16, device=device)
+        golden = x.clone()
+        dist.all_reduce(golden, group=get_tp_group().device_group)
+        streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        for i in range(300):
+            if local_rank == i % world_size and i % 7 == 0:
+                time.sleep(0.02)
+            with torch.cuda.stream(streams[i % 2]):
+                out = comm.all_reduce(x)
+            if i % 50 == 49:
+                torch.accelerator.synchronize()
+                # Reduction order differs from NCCL by a few bf16 ulps; the
+                # cross-stream race corrupts elements by 10 to 1000.
+                torch.testing.assert_close(out, golden, atol=0.5, rtol=0.02)
+        torch.accelerator.synchronize()
+        q.put("ok")
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="SymmMemAllreduce is only available for CUDA platforms.",
+)
+@pytest.mark.parametrize("tp_size", [2, 8])  # two-shot and multimem on Blackwell
+@pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
+def test_symm_mem_allreduce_from_two_streams_does_not_deadlock(tp_size):
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = 12000 + random.randint(0, 999)
+    procs = [
+        ctx.Process(target=symm_mem_two_streams_worker, args=(r, tp_size, port, q))
+        for r in range(tp_size)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=240)
+    hung = [p.pid for p in procs if p.is_alive()]
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+    cleanup_dist_env_and_memory()
+    assert not hung, f"symm-mem all-reduce from two streams deadlocked: {hung}"
+    results = [q.get(timeout=5) for _ in procs]
+    if any(r.startswith("skip") for r in results):
+        pytest.skip(results[0])
+    assert results == ["ok"] * tp_size
+    assert all(p.exitcode == 0 for p in procs)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="SymmMemAllreduce is only available for CUDA platforms.",
