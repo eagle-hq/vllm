@@ -153,16 +153,21 @@ def symm_mem_two_streams_worker(local_rank: int, world_size: int, port: int, q):
         golden = x.clone()
         dist.all_reduce(golden, group=get_tp_group().device_group)
         streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        outs = []
         for i in range(300):
             if local_rank == i % world_size and i % 7 == 0:
                 time.sleep(0.02)
             with torch.cuda.stream(streams[i % 2]):
-                out = comm.all_reduce(x)
+                outs.append(comm.all_reduce(x))
             if i % 50 == 49:
                 torch.accelerator.synchronize()
+                # Every result, not only the last: a copy out of the shared
+                # buffer that runs after the next op wrote it is wrong too.
                 # Reduction order differs from NCCL by a few bf16 ulps; the
                 # cross-stream race corrupts elements by 10 to 1000.
-                torch.testing.assert_close(out, golden, atol=0.5, rtol=0.02)
+                for out in outs:
+                    torch.testing.assert_close(out, golden, atol=0.5, rtol=0.02)
+                outs.clear()
         torch.accelerator.synchronize()
         q.put("ok")
 
