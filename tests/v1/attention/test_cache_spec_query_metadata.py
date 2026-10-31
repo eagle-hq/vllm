@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Query-head metadata must not become a cache-layout merge constraint."""
+
 from dataclasses import replace
 
 import pytest
