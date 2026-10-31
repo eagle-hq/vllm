@@ -280,17 +280,12 @@ if flashinfer_comm is not None:
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
             weight_bias=weight_bias,
-            # The one-shot Lamport all-reduce signals PDL completion before its
-            # output buffer is committed when trigger_completion_at_end is
-            # False, so the next PDL-launched kernel can read the uninitialized
-            # Lamport buffer and produce NaN. This only fires for
-            # num_tokens <= PDL_ADVANCE_LAUNCH_TOKENS (the batch=1 / spec-decode
-            # shapes, where the one-shot path is always selected). Complete at
-            # the end for the one-shot path; the two-shot path is synchronized
-            # and keeps the early completion. Related one-shot instability in
-            # the same kernel: flashinfer-ai/flashinfer#1223.
-            trigger_completion_at_end=(use_oneshot is True)
-            or num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
+            # At small batches the next PDL kernel launches and runs its
+            # prologue while this one reduces, and its grid dependency sync
+            # still waits for the whole all-reduce. FlashInfer < 0.7.2 read
+            # residual_in before that sync, which gave NaN here (#45448, fixed
+            # in flashinfer-ai/flashinfer#5081).
+            trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
 
     direct_register_custom_op(

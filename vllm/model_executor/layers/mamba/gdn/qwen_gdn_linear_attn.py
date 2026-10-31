@@ -665,6 +665,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             self._ba_stream = aux_stream()
             self._ba_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Set by process_weights_after_loading when in_proj_ba is folded into
+        # the in_proj_qkvz GEMM: (qkvz width, ba width) of the fused output.
+        self.in_proj_fused_split: tuple[int, int] | None = None
+        self._lora_enabled = vllm_config.lora_config is not None
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -921,6 +925,85 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
         return b, a
+
+    def _can_fuse_in_proj(self) -> bool:
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        return (
+            current_platform.is_cuda()
+            and not self._lora_enabled
+            and not self.disable_tp_for_ba_proj
+            and type(qkvz.quant_method) is UnquantizedLinearMethod
+            and type(ba.quant_method) is UnquantizedLinearMethod
+            and qkvz.bias is None
+            and ba.bias is None
+            and qkvz.weight.dim() == 2
+            and ba.weight.dim() == 2
+            and qkvz.weight.shape[1] == ba.weight.shape[1]
+            and qkvz.weight.dtype == ba.weight.dtype
+            and qkvz.weight.device == ba.weight.device
+        )
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Fold in_proj_ba into the in_proj_qkvz GEMM.
+
+        in_proj_ba has only 2 * num_v_heads / tp output features, so as its own
+        GEMM it costs a full launch (often with a split-K reduction) per layer
+        and token. Its rows are appended to in_proj_qkvz's weight, zero-padded
+        so that each row of the fused output stays 16-byte aligned, and the
+        forward slices the qkvz and ba parts out of one GEMM output. Both
+        layers keep their weights as views of the fused tensor, so the weight
+        loaders keep writing to the right rows.
+        """
+        if self.in_proj_fused_split is not None or not self._can_fuse_in_proj():
+            return
+        qkvz_w = self.in_proj_qkvz.weight
+        ba_w = self.in_proj_ba.weight
+        n_qkvz, n_ba = qkvz_w.shape[0], ba_w.shape[0]
+        n_pad = -(n_qkvz + n_ba) % (16 // qkvz_w.element_size())
+        fused = torch.cat(
+            [qkvz_w.data, ba_w.data, ba_w.data.new_zeros(n_pad, ba_w.shape[1])]
+        )
+        qkvz_w.data = fused
+        ba_w.data = fused[n_qkvz : n_qkvz + n_ba]
+        self.in_proj_fused_split = (n_qkvz, n_ba)
+
+    def project_input(
+        self,
+        hidden_states: torch.Tensor,
+        qkvz_input: QuantizedActivation | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the (qkvz, ba) input projections.
+
+        Fused, one GEMM computes both (see process_weights_after_loading).
+        Otherwise in_proj_qkvz reads ``qkvz_input`` (``hidden_states``
+        pre-quantized for it) if given, and in_proj_ba reads ``hidden_states``,
+        on the aux stream when one is set. Fusion needs unquantized layers, so
+        ``qkvz_input`` is never given to a fused layer.
+        """
+        if self.in_proj_fused_split is not None:
+            n_qkvz, n_ba = self.in_proj_fused_split
+            fused, _ = self.in_proj_qkvz(hidden_states)
+            return fused[..., :n_qkvz], fused[..., n_qkvz : n_qkvz + n_ba]
+        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
+        if self._ba_stream is None:
+            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
+            ba, _ = self.in_proj_ba(hidden_states)
+            return mixed_qkvz, ba
+        # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
+        # capture: eagerly the stream switch costs more host time than it
+        # saves. ba is enqueued first (aux-first order); qkvz-first
+        # regressed block-FP8 qkvz from ~100 tokens.
+        start, done = self._ba_events
+        mixed_qkvz, (ba,) = execute_in_parallel(
+            lambda: self.in_proj_qkvz(qkvz_in)[0],
+            [lambda: self.in_proj_ba(hidden_states)[0]],
+            start,
+            [done],
+            [self._ba_stream],
+            enable=hidden_states.size(0) <= _BA_PROJ_OVERLAP_MAX_TOKENS
+            and torch.cuda.is_current_stream_capturing(),
+        )
+        return mixed_qkvz, ba
 
     def fix_query_key_value_ordering(
         self,
@@ -1192,25 +1275,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
-        if self._ba_stream is None:
-            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
-            ba, _ = self.in_proj_ba(hidden_states)
-        else:
-            # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
-            # capture: eagerly the stream switch costs more host time than it
-            # saves. ba is enqueued first (aux-first order); qkvz-first
-            # regressed block-FP8 qkvz from ~100 tokens.
-            start, done = self._ba_events
-            mixed_qkvz, (ba,) = execute_in_parallel(
-                lambda: self.in_proj_qkvz(qkvz_in)[0],
-                [lambda: self.in_proj_ba(hidden_states)[0]],
-                start,
-                [done],
-                [self._ba_stream],
-                enable=num_tokens <= _BA_PROJ_OVERLAP_MAX_TOKENS
-                and torch.cuda.is_current_stream_capturing(),
-            )
+        mixed_qkvz, ba = self.project_input(hidden_states, qkvz_input)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
@@ -2421,22 +2486,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         x_shape = x.shape
         assert output_gate.shape == x_shape
         assert out.shape == x_shape
-        x_2d = x.reshape(-1, x_shape[-1])
-        output_gate_2d = output_gate.reshape(-1, x_shape[-1])
-        out_2d = out.reshape(-1, x_shape[-1])
+        group_size = (
+            x_shape[-1] if self.norm.group_size is None else self.norm.group_size
+        )
+        weight = self.norm.weight.contiguous()
+        if (
+            x.dim() == 3
+            and group_size == x_shape[-1]
+            and output_gate.stride(-1) == 1
+            and output_gate.stride(-2) == x_shape[-1]
+            and x.is_contiguous()
+            and out.is_contiguous()
+        ):
+            # One row per token, one group per head sharing the weight: the
+            # gate is a strided view of the input projection, and flattening
+            # it per head would copy it.
+            x_2d = x.view(x_shape[0], -1)
+            output_gate_2d = output_gate.flatten(-2)
+            out_2d = out.view(x_shape[0], -1)
+        else:
+            x_2d = x.reshape(-1, x_shape[-1])
+            output_gate_2d = output_gate.reshape(-1, x_shape[-1])
+            out_2d = out.reshape(-1, x_shape[-1])
         assert x_2d.stride(-1) == 1
         assert output_gate_2d.stride(-1) == 1
         assert out_2d.stride(-1) == 1
         layer_norm_fwd(
             x_2d,
-            self.norm.weight.contiguous(),
+            weight,
             self.norm.bias,
             self.norm.eps,
             z=output_gate_2d,
             out=out_2d,
-            group_size=(
-                x_shape[-1] if self.norm.group_size is None else self.norm.group_size
-            ),
+            group_size=group_size,
             norm_before_gate=self.norm.norm_before_gate,
             is_rms_norm=True,
             activation=self.norm.activation,

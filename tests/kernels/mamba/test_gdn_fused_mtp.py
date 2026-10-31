@@ -204,6 +204,7 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_fused_gdn_spec_decode=True,
+        in_proj_fused_split=None,
         _ba_stream=None,
         norm=types.SimpleNamespace(
             weight=torch.empty(V, dtype=torch.bfloat16, device=device)
@@ -215,9 +216,9 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
         in_proj_ba=lambda _: (ba, None),
         out_proj=lambda x: (x, None),
     )
-    layer.forward_cuda = types.MethodType(
-        QwenGatedDeltaNetAttention.forward_cuda, layer
-    )
+    for name in ("forward_cuda", "project_input"):
+        method = getattr(QwenGatedDeltaNetAttention, name)
+        setattr(layer, name, types.MethodType(method, layer))
 
     def packed_op(
         actual_qkvz: torch.Tensor,

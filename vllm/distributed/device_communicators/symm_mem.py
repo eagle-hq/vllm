@@ -110,6 +110,8 @@ class SymmMemCommunicator:
             )
             return
         self.force_multimem = force_multimem
+        # The stream of the last all-reduce; see all_reduce.
+        self.last_stream: torch.cuda.Stream | None = None
         self.disabled = False
         if envs.VLLM_BATCH_INVARIANT:
             self.disabled = True
@@ -129,8 +131,27 @@ class SymmMemCommunicator:
     ) -> torch.Tensor | None:
         if not self.should_use_symm_mem(inp):
             return None
-        if out is None:
-            out = torch.empty_like(inp)
+        result = torch.empty_like(inp) if out is None else out
+        # The symm-mem barriers match ops by issue order across ranks and every
+        # op reuses the communicator's one buffer, but CUDA does not order
+        # kernels across streams. vLLM issues all-reduces from several streams
+        # during startup (profiling, warmup, graph capture), so one rank could
+        # run two of them in the opposite order or overwrite the buffer while
+        # another op still reads it (pytorch/pytorch#189228). When the calling
+        # stream changes, wait for the previous one first. Calls on one stream
+        # are already ordered, so steady-state decode pays nothing. A capture
+        # is not fenced: it starts after a device synchronize, cannot wait on
+        # a stream outside it, and its graph replays in order on one stream.
+        if not torch.cuda.is_current_stream_capturing():
+            stream, last = torch.cuda.current_stream(), self.last_stream
+            if last is not None and last != stream:
+                stream.wait_stream(last)
+            self.last_stream = stream
+        self._all_reduce_buffer(inp)
+        result.copy_(self.buffer[: inp.numel()].view(result.shape))
+        return result
+
+    def _all_reduce_buffer(self, inp: torch.Tensor) -> None:
         self.buffer[: inp.numel()].copy_(inp.view(-1))
 
         # Determine which algorithm to use
@@ -152,5 +173,3 @@ class SymmMemCommunicator:
             torch.ops.symm_mem.two_shot_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
-        out.copy_(self.buffer[: inp.numel()].view(out.shape))
-        return out
