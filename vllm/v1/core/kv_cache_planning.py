@@ -415,7 +415,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
-    vllm_config: VllmConfig,
+    vllm_config: VllmConfig | None = None,
 ) -> list[KVCacheGroupSpec]:
     """Generates the KV cache groups for hybrid models with multiple
     attention types but still with a uniform page size (physical memory per
@@ -475,7 +475,7 @@ def _get_kv_cache_groups_uniform_page_size(
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
-        vllm_config: The global VllmConfig
+        vllm_config: The global VllmConfig, read only with several buckets
     Returns:
         The generated KVCacheGroupSpecs
 
@@ -518,19 +518,28 @@ def _get_kv_cache_groups_uniform_page_size(
     # (bounding the number of groups, so e.g. a single-layer drafter bucket
     # cannot force per-layer groups) up to the largest bucket. Ties prefer
     # fewer groups.
+    # One bucket needs no padding at its own size, which is also the fewest
+    # groups, so the search below would pick it.
     bucket_sizes = [len(layers) for layers in layer_buckets]
-    padding_cost = [
-        max(kv_cache_spec[name].max_memory_usage_bytes(vllm_config) for name in names)
-        for names in layer_buckets
-    ]
-    min_group_layers = vllm_config.cache_config.min_kv_cache_group_layers
-    group_size = min(
-        range(min(min_group_layers, max(bucket_sizes)), max(bucket_sizes) + 1),
-        key=lambda size: (
-            sum(c * (-n % size) for n, c in zip(bucket_sizes, padding_cost)),
-            sum(cdiv(n, size) for n in bucket_sizes),
-        ),
-    )
+    if len(layer_buckets) == 1:
+        group_size = bucket_sizes[0]
+    else:
+        assert vllm_config is not None, "costing padding needs the VllmConfig"
+        padding_cost = [
+            max(
+                kv_cache_spec[name].max_memory_usage_bytes(vllm_config)
+                for name in names
+            )
+            for names in layer_buckets
+        ]
+        min_group_layers = vllm_config.cache_config.min_kv_cache_group_layers
+        group_size = min(
+            range(min(min_group_layers, max(bucket_sizes)), max(bucket_sizes) + 1),
+            key=lambda size: (
+                sum(c * (-n % size) for n, c in zip(bucket_sizes, padding_cost)),
+                sum(cdiv(n, size) for n in bucket_sizes),
+            ),
+        )
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
