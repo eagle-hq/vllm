@@ -46,6 +46,7 @@ def _layer(*, lora=False, disable_tp_ba=False, ba_quant_method=None):
         in_proj_qkvz=_Linear(N_QKVZ, HIDDEN),
         in_proj_ba=_Linear(N_BA, HIDDEN, ba_quant_method),
         in_proj_fused_split=None,
+        _ba_stream=None,
         _lora_enabled=lora,
         disable_tp_for_ba_proj=disable_tp_ba,
     )

@@ -968,16 +968,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.in_proj_fused_split = (n_qkvz, n_ba)
 
     def project_input(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        qkvz_input: QuantizedActivation | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the (qkvz, ba) input projections, from one GEMM if fused."""
-        if self.in_proj_fused_split is None:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        """Return the (qkvz, ba) input projections.
+
+        Fused, one GEMM computes both (see process_weights_after_loading).
+        Otherwise in_proj_qkvz reads ``qkvz_input`` (``hidden_states``
+        pre-quantized for it) if given, and in_proj_ba reads ``hidden_states``,
+        on the aux stream when one is set. Fusion needs unquantized layers, so
+        ``qkvz_input`` is never given to a fused layer.
+        """
+        if self.in_proj_fused_split is not None:
+            n_qkvz, n_ba = self.in_proj_fused_split
+            fused, _ = self.in_proj_qkvz(hidden_states)
+            return fused[..., :n_qkvz], fused[..., n_qkvz : n_qkvz + n_ba]
+        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
+        if self._ba_stream is None:
+            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
             ba, _ = self.in_proj_ba(hidden_states)
             return mixed_qkvz, ba
-        n_qkvz, n_ba = self.in_proj_fused_split
-        fused, _ = self.in_proj_qkvz(hidden_states)
-        return fused[..., :n_qkvz], fused[..., n_qkvz : n_qkvz + n_ba]
+        # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
+        # capture: eagerly the stream switch costs more host time than it
+        # saves. ba is enqueued first (aux-first order); qkvz-first
+        # regressed block-FP8 qkvz from ~100 tokens.
+        start, done = self._ba_events
+        mixed_qkvz, (ba,) = execute_in_parallel(
+            lambda: self.in_proj_qkvz(qkvz_in)[0],
+            [lambda: self.in_proj_ba(hidden_states)[0]],
+            start,
+            [done],
+            [self._ba_stream],
+            enable=hidden_states.size(0) <= _BA_PROJ_OVERLAP_MAX_TOKENS
+            and torch.cuda.is_current_stream_capturing(),
+        )
+        return mixed_qkvz, ba
 
     def fix_query_key_value_ordering(
         self,
@@ -1249,28 +1275,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
-        if self.in_proj_fused_split is not None:
-            # One GEMM computes both (see process_weights_after_loading).
-            mixed_qkvz, ba = self.project_input(hidden_states)
-        elif self._ba_stream is None:
-            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
-            ba, _ = self.in_proj_ba(hidden_states)
-        else:
-            # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
-            # capture: eagerly the stream switch costs more host time than it
-            # saves. ba is enqueued first (aux-first order); qkvz-first
-            # regressed block-FP8 qkvz from ~100 tokens.
-            start, done = self._ba_events
-            mixed_qkvz, (ba,) = execute_in_parallel(
-                lambda: self.in_proj_qkvz(qkvz_in)[0],
-                [lambda: self.in_proj_ba(hidden_states)[0]],
-                start,
-                [done],
-                [self._ba_stream],
-                enable=num_tokens <= _BA_PROJ_OVERLAP_MAX_TOKENS
-                and torch.cuda.is_current_stream_capturing(),
-            )
+        mixed_qkvz, ba = self.project_input(hidden_states, qkvz_input)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
