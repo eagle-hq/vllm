@@ -108,6 +108,17 @@ class BaseSpeculator(ABC):
     def capture(self) -> None:
         pass
 
+    def prepare_propose(
+        self,
+        input_batch: InputBatch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        sampler: "Sampler",
+    ) -> None:
+        """Per-step work between verifying the last drafts and the next
+        `propose`, with the host's view of the batch's sampling."""
+        return
+
     @abstractmethod
     def propose(
         self,
